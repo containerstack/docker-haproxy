@@ -1,33 +1,62 @@
-ROM ubuntu:trusty
-MAINTAINER Remon Lam <remon.lam@virtualclouds.info>
+FROM alpine:3.8
 
-# Install pip and haproxy
-RUN echo 'deb http://ppa.launchpad.net/vbernat/haproxy-1.5/ubuntu trusty main' >> /etc/apt/sources.list && \
-    echo 'deb-src http://ppa.launchpad.net/vbernat/haproxy-1.5/ubuntu trusty main' >> /etc/apt/sources.list && \
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 505D97A41C61B9CD && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends haproxy python-pip && \
-    apt-get clean && \
-    pip install python-tutum==0.16.21 && \
-    rm -rf /var/lib/apt/lists/* && \
-    echo '#!/bin/sh' > /reload.sh && \
-    echo 'kill -USR1 $(cat /tmp/tutum-haproxy.pid)' >> /reload.sh && \
-    chmod +x /reload.sh
+ENV HAPROXY_MAJOR 1.8
+ENV HAPROXY_VERSION 1.8.14
+ENV HAPROXY_SHA256 b17e402578be85e58af7a3eac99b1f675953bea9f67af2e964cf8bdbd1bd3fdf
 
-ENV RSYSLOG_DESTINATION=127.0.0.1 \
-    MODE=http \
-    BALANCE=roundrobin \
-    MAXCONN=4096 \
-    OPTION="redispatch, httplog, dontlognull, forwardfor" \
-    TIMEOUT="connect 5000, client 50000, server 50000" \
-    STATS_PORT=1936 \
-    STATS_AUTH="stats:stats" \
-    SSL_BIND_OPTIONS=no-sslv3 \
-    SSL_BIND_CIPHERS="ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:DHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:AES128-GCM-SHA256:AES128-SHA256:AES128-SHA:AES256-GCM-SHA384:AES256-SHA256:AES256-SHA:DHE-DSS-AES128-SHA:DES-CBC3-SHA" \
-    HEALTH_CHECK="check"
+# see https://sources.debian.net/src/haproxy/jessie/debian/rules/ for some helpful navigation of the possible "make" arguments
+RUN set -x \
+	\
+	&& apk add --no-cache --virtual .build-deps \
+		ca-certificates \
+		gcc \
+		libc-dev \
+		linux-headers \
+		lua5.3-dev \
+		make \
+		openssl \
+		openssl-dev \
+		pcre-dev \
+		readline-dev \
+		tar \
+		zlib-dev \
+	\
+# install HAProxy
+	&& wget -O haproxy.tar.gz "https://www.haproxy.org/download/${HAPROXY_MAJOR}/src/haproxy-${HAPROXY_VERSION}.tar.gz" \
+	&& echo "$HAPROXY_SHA256 *haproxy.tar.gz" | sha256sum -c \
+	&& mkdir -p /usr/src/haproxy \
+	&& tar -xzf haproxy.tar.gz -C /usr/src/haproxy --strip-components=1 \
+	&& rm haproxy.tar.gz \
+	\
+	&& makeOpts=' \
+		TARGET=linux2628 \
+		USE_LUA=1 LUA_INC=/usr/include/lua5.3 LUA_LIB=/usr/lib/lua5.3 \
+		USE_OPENSSL=1 \
+		USE_PCRE=1 PCREDIR= \
+		USE_ZLIB=1 \
+	' \
+	&& make -C /usr/src/haproxy -j "$(getconf _NPROCESSORS_ONLN)" all $makeOpts \
+	&& make -C /usr/src/haproxy install-bin $makeOpts \
+	\
+	&& mkdir -p /usr/local/etc/haproxy \
+	&& cp -R /usr/src/haproxy/examples/errorfiles /usr/local/etc/haproxy/errors \
+	&& rm -rf /usr/src/haproxy \
+	\
+	&& runDeps="$( \
+		scanelf --needed --nobanner --format '%n#p' --recursive /usr/local \
+			| tr ',' '\n' \
+			| sort -u \
+			| awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
+	)" \
+	&& apk add --virtual .haproxy-rundeps $runDeps \
+	&& apk del .build-deps
 
-# Add scripts
-ADD haproxy /haproxy
+# https://www.haproxy.org/download/1.8/doc/management.txt
+# "4. Stopping and restarting HAProxy"
+# "when the SIGTERM signal is sent to the haproxy process, it immediately quits and all established connections are closed"
+# "graceful stop is triggered when the SIGUSR1 signal is sent to the haproxy process"
+STOPSIGNAL SIGUSR1
 
-EXPOSE 80 443 1936
-CMD ["python", "/haproxy/main.py"]
+COPY docker-entrypoint.sh /
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
